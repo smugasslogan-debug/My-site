@@ -1,110 +1,198 @@
 import os
 import shutil
 import tempfile
-from flask import Flask, request, jsonify, send_file, render_template, after_this_request
+from pathlib import Path
+
+from flask import Flask, request, jsonify, send_file, render_template
 from flask_cors import CORS
 from yt_dlp import YoutubeDL
+
 
 app = Flask(__name__)
 CORS(app)
 
+# Render provides PORT automatically.
+# Locally, this defaults to 5000.
+PORT = int(os.environ.get("PORT", 5000))
 
-@app.route('/')
+
+@app.route("/")
 def home():
-    return render_template('index.html')
+    return render_template("index.html")
 
 
-@app.route('/convert', methods=['POST'])
+@app.route("/convert", methods=["POST"])
 def convert_video():
-    data = request.json or {}
-    video_url = data.get('url')
-    requested_format = data.get('format', 'mp3').lower()
+    data = request.get_json(silent=True) or {}
 
+    video_url = data.get("url")
+    requested_format = str(data.get("format", "mp3")).lower()
+
+    # Validate URL
     if not video_url:
-        return jsonify({"error": "Missing video URL"}), 400
+        return jsonify({
+            "error": "Missing video URL."
+        }), 400
 
-    if requested_format not in ['mp3', 'mp4']:
-        return jsonify({"error": "Unsupported format type. Use mp3 or mp4."}), 400
+    # Validate requested format
+    if requested_format not in ("mp3", "mp4"):
+        return jsonify({
+            "error": "Unsupported format. Use mp3 or mp4."
+        }), 400
 
-    # Temporary directory for this download instance
-    temp_dir = tempfile.mkdtemp()
-
-    # Automatically clean up the temp directory after the response is sent
-    @after_this_request
-    def cleanup(response):
-        try:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-        except Exception as e:
-            app.logger.error(f"Error cleaning up temp directory: {e}")
-        return response
+    # Create a temporary directory for this conversion.
+    temp_dir = tempfile.mkdtemp(prefix="video_convert_")
 
     try:
-        if requested_format == 'mp3':
+        output_template = os.path.join(
+            temp_dir,
+            "%(title)s.%(ext)s"
+        )
+
+        if requested_format == "mp3":
             ydl_opts = {
-                'format': 'bestaudio/best',
-                'outtmpl': os.path.join(temp_dir, '%(title)s.%(ext)s'),
-                'noplaylist': True,
-                'concurrent_fragment_downloads': 5,
-                'postprocessors': [{
-                    'key': 'FFmpegExtractAudio',
-                    'preferredcodec': 'mp3',
-                    'preferredquality': '128',
-                }],
-                'quiet': True,
-                'no_warnings': True
+                "format": "bestaudio/best",
+
+                "outtmpl": output_template,
+
+                "noplaylist": True,
+
+                "concurrent_fragment_downloads": 5,
+
+                "postprocessors": [
+                    {
+                        "key": "FFmpegExtractAudio",
+                        "preferredcodec": "mp3",
+                        "preferredquality": "128",
+                    }
+                ],
+
+                "quiet": True,
+                "no_warnings": True,
+
+                # Avoid unnecessary metadata/files.
+                "writethumbnail": False,
+                "writeinfojson": False,
+                "writesubtitles": False,
+                "writeautomaticsub": False,
             }
-        else:  # MP4 configuration
+
+        else:
             ydl_opts = {
-                # Prefer H.264 video + AAC audio (plays everywhere),
-                # then fall back to whatever is best if unavailable.
-                'format': (
-                    'bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/'
-                    'best[ext=mp4][vcodec^=avc1]/'
-                    'bestvideo+bestaudio/best'
+                # Prefer MP4/H.264 + M4A when available.
+                "format": (
+                    "bestvideo[ext=mp4][vcodec^=avc1]+"
+                    "bestaudio[ext=m4a]/"
+                    "best[ext=mp4][vcodec^=avc1]/"
+                    "bestvideo+bestaudio/best"
                 ),
-                'outtmpl': os.path.join(temp_dir, '%(title)s.%(ext)s'),
-                'noplaylist': True,
-                'concurrent_fragment_downloads': 5,
-                'merge_output_format': 'mp4',
-                'quiet': True,
-                'no_warnings': True
+
+                "outtmpl": output_template,
+
+                "noplaylist": True,
+
+                "concurrent_fragment_downloads": 5,
+
+                # Make the final merged file MP4.
+                "merge_output_format": "mp4",
+
+                "quiet": True,
+                "no_warnings": True,
+
+                "writethumbnail": False,
+                "writeinfojson": False,
+                "writesubtitles": False,
+                "writeautomaticsub": False,
             }
 
+        # Download / convert.
         with YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(video_url, download=True)
+            ydl.download([video_url])
 
-            # yt-dlp reports the final file path (after merging/post-processing)
-            target_path = None
-            downloads = info.get('requested_downloads') or []
-            if downloads:
-                target_path = downloads[0].get('filepath')
+        # Find the final output file.
+        expected_extension = f".{requested_format}"
 
-            # Fallback: search the temp dir for a file with the requested extension
-            if not target_path or not os.path.exists(target_path):
-                matching_files = [
-                    os.path.join(temp_dir, f) for f in os.listdir(temp_dir)
-                    if f.endswith(f".{requested_format}")
-                ]
-                if matching_files:
-                    target_path = matching_files[0]
-                else:
-                    return jsonify({"error": "Output target file missing after conversion."}), 500
+        output_files = [
+            path
+            for path in Path(temp_dir).iterdir()
+            if path.is_file()
+            and path.suffix.lower() == expected_extension
+        ]
 
-            mimetype = "audio/mpeg" if requested_format == 'mp3' else "video/mp4"
-            download_name = os.path.basename(target_path)
+        if not output_files:
+            return jsonify({
+                "error": "Conversion completed, but the output file could not be found."
+            }), 500
 
-            # Stream file directly from disk instead of loading into RAM
-            return send_file(
-                target_path,
-                mimetype=mimetype,
-                as_attachment=True,
-                download_name=download_name
-            )
+        # There should normally only be one output file.
+        target_path = output_files[0]
 
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        # Pick the correct MIME type.
+        if requested_format == "mp3":
+            mimetype = "audio/mpeg"
+        else:
+            mimetype = "video/mp4"
+
+        # Prevent weird filenames from causing problems.
+        download_name = target_path.name
+
+        response = send_file(
+            target_path,
+            mimetype=mimetype,
+            as_attachment=True,
+            download_name=download_name
+        )
+
+        # Delete the temporary directory after the response is finished.
+        @response.call_on_close
+        def cleanup():
+            try:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            except Exception as error:
+                app.logger.error(
+                    "Failed to clean temporary directory: %s",
+                    error
+                )
+
+        return response
+
+    except Exception as error:
+        # Clean up immediately if conversion fails.
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+        app.logger.exception("Conversion failed")
+
+        return jsonify({
+            "error": str(error)
+        }), 500
 
 
-if __name__ == '__main__':
-    print("Backend server active at http://127.0.0.1:5000")
-    app.run(host='127.0.0.1', port=5000, debug=True)
+@app.errorhandler(413)
+def request_too_large(error):
+    return jsonify({
+        "error": "Request is too large."
+    }), 413
+
+
+@app.errorhandler(404)
+def page_not_found(error):
+    return jsonify({
+        "error": "Endpoint not found."
+    }), 404
+
+
+@app.errorhandler(500)
+def internal_server_error(error):
+    return jsonify({
+        "error": "Internal server error."
+    }), 500
+
+
+if __name__ == "__main__":
+    print(f"Backend server active on http://127.0.0.1:{PORT}")
+
+    app.run(
+        host="0.0.0.0",
+        port=PORT,
+        debug=False
+    )
